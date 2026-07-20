@@ -50,12 +50,12 @@ _HEARTBEAT_COORD_DICT_NAME = "modal-temporal-heartbeat-coord"
 def _coord_key(info: Info) -> str:
     """Coordination key for an activity's heartbeat hand-off.
 
-    Stable across retries: task_token changes every attempt but activity_id does
-    not, so a crash-looping activity reuses one Dict slot instead of leaking one
-    key per attempt. Each retry's dispatcher overwrites the previous attempt's
-    stale marker, so the only residual orphan is one key per activity that
-    hard-crashes on its final attempt (modal.Dict has no TTL to expire it)."""
-    return f"{info.workflow_id}/{info.workflow_run_id}/{info.activity_id}"
+    Per-attempt: a preempted attempt's finally-cleanup (coord_dict.pop) runs
+    during Modal's SIGTERM grace and would otherwise clobber the next attempt's
+    queued marker under a stable key, leaving the retry's cold start
+    un-heartbeated. Costs one orphaned key per crashed attempt (modal.Dict has
+    no TTL)."""
+    return f"{info.workflow_id}/{info.workflow_run_id}/{info.activity_id}/{info.attempt}"
 
 
 def _queued_marker(info: Info) -> str:
@@ -87,9 +87,11 @@ async def _auto_heartbeat_loop(
     interval = heartbeat_timeout.total_seconds() / 2.0
     while True:
         try:
-            await asyncio.sleep(interval)
+            # Heartbeat the instant the worker takes over from the dispatcher,
+            # before the first interval elapses.
             await handle.heartbeat()
             print(f"[external worker] heartbeat sent for {activity_name}")
+            await asyncio.sleep(interval)
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -115,10 +117,11 @@ async def _dispatcher_heartbeat_loop(
     queued = _queued_marker(info)
     interval = info.heartbeat_timeout.total_seconds() / 2.0
     while True:
-        await asyncio.sleep(interval)
-        # Re-read each interval and step down once our marker is gone: the worker
-        # took over (started:<attempt>), the activity finished (key removed), or a
-        # newer attempt superseded us (queued:<attempt+1>).
+        # On a retry the dispatcher is the sole heartbeater while the container
+        # cold-starts, so heartbeat before the first sleep.
+        # Step down once our marker is gone: the worker took over
+        # (started:<attempt>), the activity finished (key removed), or a newer
+        # attempt superseded us (queued:<attempt+1>).
         if await coord_dict.get.aio(key) != queued:
             return
         try:
@@ -127,6 +130,7 @@ async def _dispatcher_heartbeat_loop(
         except Exception as e:
             print(f"[dispatcher] queued heartbeat failed for {info.activity_type}: {e}")
             return
+        await asyncio.sleep(interval)
 
 
 async def run_activity(fn: Callable, args: Any, client: Client, info: Info):
